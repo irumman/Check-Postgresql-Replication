@@ -1,0 +1,169 @@
+#!/bin/bash
+# ========================================================================================
+# Postgres replication lag nagios check using psql and bash.
+#
+# 2013 Wanelo Inc, Apache License.
+# This script expects psql to be in the PATH.
+#q
+# Usage: ./check_postgres_replication [ -h <host> ] [ -m <master> ] [ -U user ] [ -x <units> ]
+#                                      [-w <warn_perc>] [-c <critical_perc>]
+#   -h   --host       slave host (default 127.0.0.1)
+#   -m   --master     master fqdn or ip (required)
+#   -U   --user       database user (default postgres)
+#   -x   --units      units of measurement to display (KB or MB, default MB)
+#   -d   --dbname     dbname to connect with postgresql (default postgres)  //added by Rumman for Vantage
+#   -w   --warning    warning threshold (default 10MB)
+#   -c   --critical   critical threshold (default 15MB)
+# ========================================================================================
+
+
+
+# Nagios return codes
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# set thresholds in bytes
+WARNING_THRESHOLD=10485760
+CRITICAL_THRESHOLD=15728640
+HOST="127.0.0.1"
+USER=postgres
+UNITS=MB
+DBNAME=postgres
+DIFF="0"
+# Parse parameters
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h | --host)
+                shift
+                HOST=$1
+                ;;
+        -m | --master)
+                shift
+                MASTER=$1
+                ;;
+        -U | --user)
+                shift
+                USER=$1
+                ;;
+                
+        -d | --dbname)
+                shift
+                DBNAME=$1
+                ;;        
+        -x | --units)
+                shift
+                UNITS=$1
+                ;;
+        -w | --warning)
+                shift
+                WARNING_THRESHOLD=$1
+                ;;
+        -c | --critical)
+                shift
+                CRITICAL_THRESHOLD=$1
+                ;;
+        *)  echo "Unknown argument: $1"
+            exit $STATE_UNKNOWN
+            ;;
+        esac
+shift
+done
+
+if [ -z "$MASTER" ]; then
+  echo "pass master host in parameters via -m flag"
+  exit 1
+fi
+
+# Error checking of arguments
+case "$UNITS" in
+    KB)
+        DIVISOR=1024
+        ;;
+    MB)
+        DIVISOR=1048576
+        ;;
+    *)
+        check_errors 1 "Incorrect unit of measurement"
+        ;;
+    esac
+
+
+PATH=/opt/local/bin:$PATH
+#NODENAME=`cat /etc/nodename`
+MASTER_SQL="SELECT pg_current_xlog_location()"
+REPLICA_SQL="SELECT pg_last_xlog_replay_location()"
+ERR=/tmp/repl_chec.$$
+
+function result {
+  DESCRIPTION=$1
+  STATUS=$2
+
+  ERROR=`cat $ERR 2>/dev/null`
+
+  if [[ "$STATUS" -eq "$STATE_CRITICAL" && ! -z "$ERROR" ]]; then
+    MESSAGE="replication check error $ERROR"
+  else
+    #DIFF_UNITS=$(diff)
+    MESSAGE="Replication lag between $MASTER and $HOST is ${DIFF}$UNITS"
+  fi
+  echo "REPLICATION  $DESCRIPTION : $MESSAGE"
+  rm -f $ERR
+  exit $STATUS
+}
+
+function check_errors {
+  if [ $1 -ne 0 ]; then
+    result "CRITICAL" $STATE_CRITICAL
+  fi
+}
+
+function xlog_to_bytes {
+  # http://eulerto.blogspot.com/2011/11/understanding-wal-nomenclature.html
+  logid="${1%%/*}"
+  offset="${1##*/}"
+  echo $((0xFF000000 * 0x$logid + 0x$offset))
+}
+
+function diff () {
+  vDIFF=$1
+  #echo "vDIFF=${vDIFF}"
+  if [ -z ${vDIFF} ]; then
+    echo "ERROR: NO DATA AVAILABLE"
+  else
+    DIFF=`echo $(( $vDIFF / $DIVISOR ))`
+  fi
+}
+
+REPLICA_XLOG=$(psql -d $DBNAME -U $USER -Atc "$REPLICA_SQL" -h $HOST 2>$ERR)
+check_errors $?
+REPLICA_BYTES=$(xlog_to_bytes $REPLICA_XLOG)
+#echo $REPLICA_BYTES
+
+if [ -z "$REPLICA_XLOG" ]; then
+  echo -n "Unable to find replica XLOG replay location" > $ERR
+  result "CRITICAL" $STATE_CRITICAL
+fi
+
+# Query master and replica for latest xlog
+MASTER_XLOG=$(psql -d $DBNAME -U $USER -Atc "$MASTER_SQL" -h $MASTER 2>$ERR)
+check_errors $?
+MASTER_BYTES=$(xlog_to_bytes $MASTER_XLOG)
+#echo $MASTER_BYTES
+
+# Calculate xlog diff in bytes
+DIFF=$(($MASTER_BYTES - $REPLICA_BYTES))
+#echo $DIFF
+diff $DIFF
+#echo $DIFF
+# Output response
+if [ $DIFF -ge $WARNING_THRESHOLD ] && [ $DIFF -lt $CRITICAL_THRESHOLD ]; then
+  result "WARNING" $STATE_WARNING
+elif [ $DIFF -ge $CRITICAL_THRESHOLD ]; then
+  result "CRITICAL" $STATE_CRITICAL
+else
+  result "OK" $STATE_OK
+fi
+
+rm -f $ERR
