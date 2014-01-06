@@ -2,7 +2,6 @@
 # ========================================================================================
 # Postgres replication lag nagios check using psql and bash.
 #
-# 2013 Wanelo Inc, Apache License.
 # This script expects psql to be in the PATH.
 #q
 # Usage: ./check_postgres_replication [ -h <host> ] [ -m <master> ] [ -U user ] [ -x <units> ]
